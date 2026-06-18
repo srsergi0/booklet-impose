@@ -329,17 +329,24 @@ def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, 
     while n_pages % 4 != 0:
         n_pages += 1
     n_sheets = n_pages // 4
-    src.close()
 
     if not quiet:
-        print(f"  Embedding PDF ({n_orig} pages)...")
+        print(f"  Rendering {n_orig} pages (72 DPI JPEG)...")
 
-    with open(input_path, "rb") as f:
-        pdf_b64 = base64.b64encode(f.read()).decode('ascii')
-
+    src_tmp = src
+    page_images = []
+    for i, idx in enumerate(page_indices):
+        page = src_tmp[idx]
+        pix = page.get_pixmap(dpi=72)
+        img_bytes = pix.tobytes("jpeg")
+        img_b64 = base64.b64encode(img_bytes).decode('ascii')
+        page_images.append(img_b64)
+        if not quiet:
+            pct = (i + 1) / n_orig * 100
+            print(f"    {i+1}/{n_orig} ({pct:.0f}%)", end='\r')
     if not quiet:
-        pdf_size_mb = len(pdf_b64) * 3 / 4 / (1024 * 1024)
-        print(f"  PDF embedded: {pdf_size_mb:.1f} MB")
+        print(f"    {n_orig}/{n_orig} (100%)   ")
+    src_tmp.close()
 
     html_path = os.path.splitext(input_path)[0] + "-preview.html"
 
@@ -365,6 +372,8 @@ def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, 
   </div>
 </div>''')
 
+    pages_json = '[' + ','.join(f'"{img}"' for img in page_images) + ']'
+
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -383,21 +392,17 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
 .content {{ display: none; }}
 .content.active {{ display: block; }}
 
-#flipbook-view {{ min-height: calc(100vh - 100px); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }}
-#flipbook-container {{ width: 100%; max-width: 900px; }}
-.stf__parent {{ margin: 0 auto; }}
-.flipbook-nav {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }}
-.flipbook-nav button {{ background: #0f3460; color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.2s; }}
-.flipbook-nav button:hover {{ background: #e94560; }}
-.flipbook-nav button:disabled {{ background: #333; color: #666; cursor: default; }}
-.flipbook-nav .page-info {{ font-size: 14px; color: #888; min-width: 120px; text-align: center; }}
-.loading {{ color: #888; font-size: 16px; text-align: center; padding: 40px; }}
-.progress-bar {{ width: 200px; height: 6px; background: #333; border-radius: 3px; margin: 12px auto; overflow: hidden; }}
-.progress-fill {{ height: 100%; background: #e94560; border-radius: 3px; transition: width 0.3s; }}
-
-#fallback-viewer {{ display: none; text-align: center; padding: 20px; }}
-.spread-display {{ display: flex; gap: 4px; justify-content: center; align-items: center; }}
-.spread-display img {{ max-height: 75vh; max-width: 45vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; background: #fff; }}
+#spread-view {{ padding: 20px; text-align: center; min-height: 400px; user-select: none; }}
+#spread-view .spreader {{ display: flex; gap: 4px; justify-content: center; align-items: center; perspective: 1800px; min-height: 60vh; }}
+#spread-view .spreader img {{ max-height: 75vh; max-width: 44vw; box-shadow: 0 4px 30px rgba(0,0,0,0.6); border-radius: 4px; background: #fff; transition: transform 0.4s ease, box-shadow 0.4s ease; cursor: pointer; }}
+#spread-view .spreader img:hover {{ box-shadow: 0 8px 40px rgba(233,69,96,0.3); }}
+#spread-view .spreader img.turning {{ transform: rotateY(-12deg); }}
+.nav {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }}
+.nav button {{ background: #0f3460; color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.2s; min-width: 80px; }}
+.nav button:hover {{ background: #e94560; }}
+.nav button:disabled {{ background: #333; color: #666; cursor: default; }}
+.nav .info {{ font-size: 14px; color: #888; min-width: 130px; text-align: center; }}
+.nav input[type=range] {{ width: 160px; accent-color: #e94560; }}
 
 #print-view {{ padding: 16px 20px; }}
 .sheet-row {{ display: flex; align-items: stretch; margin-bottom: 6px; gap: 6px; }}
@@ -421,26 +426,20 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
   <div class="info">{os.path.basename(input_path)} &bull; {n_orig} pages &bull; {n_sheets} {paper_size.upper()} sheets</div>
   <div style="flex:1"></div>
   <div class="tabs">
-    <div class="tab active" onclick="switchTab('flipbook')">&#x1F4DA; Flipbook</div>
+    <div class="tab active" onclick="switchTab('spread')">&#x1F4DA; Reader</div>
     <div class="tab" onclick="switchTab('print')">&#x1F5A8; Print Layout</div>
   </div>
 </div>
 
-<div id="flipbook-view" class="content active">
-  <div id="loading" class="loading">
-    <div id="loading-text">Loading PDF...</div>
-    <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width: 0%"></div></div>
-  </div>
-  <div id="flipbook-container" style="display:none;">
-    <div id="flipbook"></div>
-  </div>
-  <div class="flipbook-nav" id="flipbook-nav" style="display:none;">
-    <button id="btn-prev" onclick="flipPrev()">&#x25C0; Prev</button>
-    <span class="page-info" id="page-info">Page 1</span>
-    <button id="btn-next" onclick="flipNext()">Next &#x25B6;</button>
-  </div>
-  <div id="fallback-viewer">
-    <div id="fallback-display" class="spread-display"></div>
+<div id="spread-view" class="content active">
+  <div class="spreader" id="spreader"></div>
+  <div class="nav" id="nav">
+    <button id="btn-first" onclick="goFirst()">&#x23EE; First</button>
+    <button id="btn-prev" onclick="goPrev()">&#x25C0; Prev</button>
+    <span class="info" id="page-info">1 &ndash; 2 / {n_orig}</span>
+    <button id="btn-next" onclick="goNext()">Next &#x25B6;</button>
+    <button id="btn-last" onclick="goLast()">Last &#x23ED;</button>
+    <input type="range" id="page-slider" min="0" max="{math.ceil(n_orig/2)-1}" value="0" oninput="goSpread(parseInt(this.value))" style="margin-left:12px;">
   </div>
 </div>
 
@@ -454,285 +453,64 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
 </div>
 
 <script>
-const PDF_DATA = "{pdf_b64}";
-const TOTAL_PAGES = {n_orig};
+const PAGES = {pages_json};
+const TOTAL = {n_orig};
 const TOTAL_SHEETS = {n_sheets};
-
-let pageFlip = null;
-let useFallback = false;
-let pageImages = [];
+const TOTAL_SPREADS = Math.ceil(TOTAL / 2);
+let spread = 0;
 
 function switchTab(name) {{
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
-  if (name === 'flipbook') {{
-    document.querySelector('.tab:first-child').classList.add('active');
-    document.getElementById('flipbook-view').classList.add('active');
-  }} else {{
-    document.querySelector('.tab:last-child').classList.add('active');
-    document.getElementById('print-view').classList.add('active');
+  document.querySelector(name === 'spread' ? '.tab:first-child' : '.tab:last-child').classList.add('active');
+  document.getElementById(name + '-view').classList.add('active');
+}}
+
+function showSpread() {{
+  const c = document.getElementById('spreader');
+  c.innerHTML = '';
+  const left = spread * 2;
+  const right = spread * 2 + 1;
+  if (left < TOTAL) {{
+    const img = document.createElement('img');
+    img.src = 'data:image/jpeg;base64,' + PAGES[left];
+    img.alt = 'Page ' + (left + 1);
+    img.title = 'Page ' + (left + 1);
+    c.appendChild(img);
   }}
-}}
-
-async function loadPDF() {{
-  const loadingText = document.getElementById('loading-text');
-  const progressFill = document.getElementById('progress-fill');
-
-  try {{
-    loadingText.textContent = 'Loading PDF.js...';
-    const pdfjsLib = window['pdfjs-dist/build/pdf'];
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
-
-    loadingText.textContent = 'Parsing PDF...';
-    progressFill.style.width = '10%';
-
-    const pdfDoc = await pdfjsLib.getDocument({{ data: atob(PDF_DATA) }}).promise;
-    const numPages = pdfDoc.numPages;
-
-    loadingText.textContent = 'Rendering pages (0/' + numPages + ')...';
-
-    const SCALE = 1.5;
-    pageImages = [];
-
-    for (let i = 1; i <= numPages; i++) {{
-      const page = await pdfDoc.getPage(i);
-      const viewport = page.getViewport({{ scale: SCALE }});
-      const canvas = document.createElement('canvas');
-      canvas.width = viewport.width;
-      canvas.height = viewport.height;
-      const ctx = canvas.getContext('2d');
-
-      await page.render({{ canvasContext: ctx, viewport: viewport }}).promise;
-
-      pageImages.push(canvas.toDataURL('image/jpeg', 0.75));
-
-      const pct = Math.round((i / numPages) * 80) + 10;
-      progressFill.style.width = pct + '%';
-      loadingText.textContent = 'Rendering pages (' + i + '/' + numPages + ')...';
-    }}
-
-    progressFill.style.width = '95%';
-    loadingText.textContent = 'Initializing flipbook...';
-    initFlipbook();
-
-  }} catch (e) {{
-    console.error('PDF.js failed:', e);
-    loadingText.textContent = 'PDF.js failed: ' + e.message + '. Using fallback.';
-    useFallback = true;
-    initFallbackFromPDF();
+  if (right < TOTAL) {{
+    const img = document.createElement('img');
+    img.src = 'data:image/jpeg;base64,' + PAGES[right];
+    img.alt = 'Page ' + (right + 1);
+    img.title = 'Page ' + (right + 1);
+    c.appendChild(img);
   }}
+  const leftPage = spread * 2 + 1;
+  const rightPage = Math.min(spread * 2 + 2, TOTAL);
+  document.getElementById('page-info').textContent = leftPage + ' &ndash; ' + rightPage + ' / ' + TOTAL;
+  document.getElementById('btn-prev').disabled = spread === 0;
+  document.getElementById('btn-first').disabled = spread === 0;
+  document.getElementById('btn-next').disabled = spread >= TOTAL_SPREADS - 1;
+  document.getElementById('btn-last').disabled = spread >= TOTAL_SPREADS - 1;
+  document.getElementById('page-slider').value = spread;
 }}
 
-function initFlipbook() {{
-  const container = document.getElementById('flipbook');
-  const containerW = Math.min(window.innerWidth - 40, 900);
-  const containerH = window.innerHeight - 160;
+function goPrev() {{ if (spread > 0) {{ spread--; showSpread(); }} }}
+function goNext() {{ if (spread < TOTAL_SPREADS - 1) {{ spread++; showSpread(); }} }}
+function goFirst() {{ spread = 0; showSpread(); }}
+function goLast() {{ spread = TOTAL_SPREADS - 1; showSpread(); }}
+function goSpread(s) {{ spread = s; showSpread(); }}
 
-  if (pageImages.length === 0) {{
-    useFallback = true;
-    initSimpleFallback();
-    return;
+document.addEventListener('keydown', e => {{
+  if (document.querySelector('.tab.active').textContent.includes('Reader')) {{
+    if (e.key === 'ArrowRight' || e.key === ' ') {{ goNext(); e.preventDefault(); }}
+    if (e.key === 'ArrowLeft') {{ goPrev(); e.preventDefault(); }}
+    if (e.key === 'Home') {{ goFirst(); e.preventDefault(); }}
+    if (e.key === 'End') {{ goLast(); e.preventDefault(); }}
   }}
-
-  const tmpImg = new Image();
-  tmpImg.src = pageImages[0];
-  tmpImg.onload = function() {{
-    const pageRatio = tmpImg.naturalWidth / tmpImg.naturalHeight;
-    const displayH = Math.min(containerH, 700);
-    const displayW = displayH * pageRatio;
-
-    try {{
-      const StPageFlip = window.St;
-      if (!StPageFlip || !StPageFlip.PageFlip) throw new Error('StPageFlip not loaded');
-
-      const pages = pageImages.map((src, i) => {{
-        const div = document.createElement('div');
-        div.className = 'page-wrapper';
-        div.style.width = displayW + 'px';
-        div.style.height = displayH + 'px';
-        div.setAttribute('data-density', i === 0 || i === TOTAL_PAGES - 1 ? 'hard' : 'soft');
-        const img = document.createElement('img');
-        img.src = src;
-        img.style.width = '100%';
-        img.style.height = '100%';
-        img.style.objectFit = 'contain';
-        img.alt = 'Page ' + (i + 1);
-        div.appendChild(img);
-        const label = document.createElement('div');
-        label.style.cssText = 'position:absolute;bottom:6px;right:10px;font-size:11px;color:rgba(0,0,0,0.35);';
-        label.textContent = i + 1;
-        div.appendChild(label);
-        return div;
-      }});
-
-      container.style.width = displayW + 'px';
-      container.style.height = displayH + 'px';
-      pages.forEach(p => container.appendChild(p));
-
-      pageFlip = new StPageFlip.PageFlip(container, {{
-        width: displayW,
-        height: displayH,
-        size: 'stretch',
-        minWidth: 280,
-        maxWidth: displayW * 1.5,
-        minHeight: 400,
-        maxHeight: displayH * 1.5,
-        showCover: true,
-        maxShadowOpacity: 0.5,
-        mobileScrollSupport: true,
-        clickEventForward: false,
-        useMouseEvents: true,
-        swipeDistance: 30,
-        showPageCorners: true,
-        disableFlipByClick: false,
-        flippingTime: 700,
-        usePortrait: true,
-        startZIndex: 0,
-        autoSize: true,
-        drawShadow: true,
-      }});
-
-      pageFlip.loadFromHTML(pages);
-      pageFlip.on('flip', (e) => updateNav());
-      pageFlip.on('changeOrientation', (e) => updateNav());
-
-      document.getElementById('loading').style.display = 'none';
-      document.getElementById('flipbook-container').style.display = 'block';
-      document.getElementById('flipbook-nav').style.display = 'flex';
-      updateNav();
-
-    }} catch (e) {{
-      console.warn('StPageFlip unavailable, using spread viewer:', e);
-      useFallback = true;
-      initSpreadViewer(displayW, displayH);
-    }}
-  }};
-}}
-
-function initSpreadViewer(pageW, pageH) {{
-  document.getElementById('loading').style.display = 'none';
-  document.getElementById('flipbook-container').style.display = 'none';
-  document.getElementById('flipbook-nav').style.display = 'flex';
-
-  let currentSpread = 0;
-  const totalSpreads = Math.ceil(TOTAL_PAGES / 2);
-
-  function showSpread() {{
-    const display = document.getElementById('fallback-display');
-    display.innerHTML = '';
-    const leftIdx = currentSpread * 2;
-    const rightIdx = currentSpread * 2 + 1;
-    if (pageImages[leftIdx]) {{
-      const leftImg = document.createElement('img');
-      leftImg.src = pageImages[leftIdx];
-      leftImg.alt = 'Page ' + (leftIdx + 1);
-      display.appendChild(leftImg);
-    }}
-    if (rightIdx < TOTAL_PAGES && pageImages[rightIdx]) {{
-      const rightImg = document.createElement('img');
-      rightImg.src = pageImages[rightIdx];
-      rightImg.alt = 'Page ' + (rightIdx + 1);
-      display.appendChild(rightImg);
-    }}
-    updateFallbackNav();
-  }}
-
-  function updateFallbackNav() {{
-    const leftPage = currentSpread * 2 + 1;
-    const rightPage = Math.min(currentSpread * 2 + 2, TOTAL_PAGES);
-    document.getElementById('page-info').textContent = leftPage + '-' + rightPage + ' / ' + TOTAL_PAGES;
-    document.getElementById('btn-prev').disabled = currentSpread === 0;
-    document.getElementById('btn-next').disabled = currentSpread >= totalSpreads - 1;
-  }}
-
-  window.flipPrev = () => {{ if (currentSpread > 0) {{ currentSpread--; showSpread(); }} }};
-  window.flipNext = () => {{ if (currentSpread < totalSpreads - 1) {{ currentSpread++; showSpread(); }} }};
-
-  showSpread();
-}}
-
-function initSimpleFallback() {{
-  document.getElementById('loading').style.display = 'none';
-  document.getElementById('flipbook-container').style.display = 'none';
-  document.getElementById('flipbook-nav').style.display = 'flex';
-  const display = document.getElementById('fallback-display');
-  display.innerHTML = '<p style="color:#888;">PDF rendering unavailable. Install poppler (pdftoppm) or mutool for best results.</p>';
-}}
-
-function initFallbackFromPDF() {{
-  document.getElementById('loading').style.display = 'none';
-  document.getElementById('flipbook-container').style.display = 'none';
-  document.getElementById('flipbook-nav').style.display = 'flex';
-  const display = document.getElementById('fallback-display');
-  display.innerHTML = '<p style="color:#888;">Failed to render PDF.</p>';
-}}
-
-function updateNav() {{
-  if (!pageFlip) return;
-  const current = pageFlip.getPageIndex();
-  const leftPage = (current + 1);
-  const rightPage = Math.min(current + 2, TOTAL_PAGES);
-  document.getElementById('page-info').textContent = leftPage + '-' + rightPage + ' / ' + TOTAL_PAGES;
-  document.getElementById('btn-prev').disabled = current <= 0;
-  document.getElementById('btn-next').disabled = current >= TOTAL_PAGES - 2;
-}}
-
-function flipPrev() {{
-  if (useFallback) return;
-  if (pageFlip) pageFlip.flipPrev();
-}}
-
-function flipNext() {{
-  if (useFallback) return;
-  if (pageFlip) pageFlip.flipNext();
-}}
-
-document.addEventListener('keydown', (e) => {{
-  if (e.key === 'ArrowLeft') {{ flipPrev(); e.preventDefault(); }}
-  if (e.key === 'ArrowRight') {{ flipNext(); e.preventDefault(); }}
 }});
 
-const externalScripts = [
-  'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs',
-  'https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js'
-];
-let loadedCount = 0;
-const totalScripts = externalScripts.length;
-let pdfjsReady = false;
-let pageflipReady = false;
-
-externalScripts.forEach(url => {{
-  const s = document.createElement('script');
-  s.type = url.endsWith('.mjs') ? 'module' : 'text/javascript';
-  if (url.endsWith('.mjs')) {{
-    s.type = 'module';
-    s.textContent = 'import * as pdfjsLib from "' + url + '"; window["pdfjs-dist/build/pdf"] = pdfjsLib; window.dispatchEvent(new Event("pdfjs-loaded"));';
-  }} else {{
-    s.src = url;
-  }}
-  s.onload = () => {{
-    if (url.includes('page-flip')) pageflipReady = true;
-    checkAllLoaded();
-  }};
-  s.onerror = () => {{ checkAllLoaded(); }};
-  document.head.appendChild(s);
-}});
-
-window.addEventListener('pdfjs-loaded', () => {{
-  pdfjsReady = true;
-  checkAllLoaded();
-}});
-
-setTimeout(() => {{ checkAllLoaded(); }}, 500);
-
-function checkAllLoaded() {{
-  if (pdfjsReady && pageflipReady) {{
-    loadPDF();
-  }} else if (!pdfjsReady && !pageflipReady) {{
-    // Both failed, try anyway with what we have
-    setTimeout(() => {{ if (!pdfjsReady || !pageflipReady) loadPDF(); }}, 2000);
-  }}
-}}
+showSpread();
 </script>
 </body>
 </html>'''
@@ -745,6 +523,33 @@ function checkAllLoaded() {{
         print(f"  Preview: {html_path}")
         print(f"  Size: {size_mb:.1f} MB")
         print(f"  Open: open {html_path}")
+
+    import webbrowser
+    webbrowser.open(f"file://{os.path.abspath(html_path)}")
+
+    return html_path
+
+    url = f"http://127.0.0.1:{port}/{preview_filename}"
+
+    def serve():
+        os.chdir(preview_dir)
+        server.serve_forever()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    if not quiet:
+        print(f"  Server: {url}")
+        print(f"  Press Ctrl+C to stop server")
+
+    webbrowser.open(url)
+
+    try:
+        thread.join()
+    except KeyboardInterrupt:
+        server.shutdown()
+        if not quiet:
+            print(f"\n  Server stopped.")
 
     return html_path
 
