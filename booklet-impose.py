@@ -13,7 +13,10 @@ import argparse
 import math
 import sys
 import os
-import datetime
+import base64
+import shutil
+import subprocess
+import tempfile
 
 try:
     import pymupdf
@@ -315,70 +318,504 @@ def verify_booklet(input_path, paper_size="a4", pages=None, quiet=False):
     src.close()
 
 
-def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None):
+def _render_pages_external(input_path, page_indices, dpi, fmt, quiet):
+    ext = "jpg" if fmt == "jpeg" else "png"
+    tmpdir = tempfile.mkdtemp(prefix="booklet-preview-")
+    try:
+        pdftoppm = shutil.which("pdftoppm")
+        mutool = shutil.which("mutool")
+        first_page = page_indices[0] + 1
+        last_page = page_indices[-1] + 1
+
+        if pdftoppm:
+            if not quiet:
+                print(f"  Rendering with pdftoppm (poppler)...")
+            prefix = os.path.join(tmpdir, "page")
+            cmd = [pdftoppm, "-jpeg", "-r", str(dpi),
+                   "-f", str(first_page), "-l", str(last_page),
+                   input_path, prefix]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                if not quiet:
+                    print(f"  pdftoppm failed: {result.stderr.strip()[:200]}")
+                return None
+            images = []
+            first_w, first_h = 400, 566
+            for i, idx in enumerate(page_indices):
+                pn = idx + 1
+                path = os.path.join(tmpdir, f"page-{pn:02d}.jpg")
+                if not os.path.exists(path):
+                    if not quiet:
+                        print(f"  pdftoppm: missing {path}")
+                    return None
+                with open(path, "rb") as f:
+                    img_data = f.read()
+                mime = "image/jpeg"
+                b64 = f"data:{mime};base64,{base64.b64encode(img_data).decode('ascii')}"
+                w, h = _img_dims_from_jpeg(img_data)
+                if i == 0:
+                    first_w, first_h = w, h
+                images.append(b64)
+            if images:
+                return images, first_w, first_h
+            return None
+
+        elif mutool:
+            if not quiet:
+                print(f"  Rendering with mutool (mupdf)...")
+            images = []
+            first_w, first_h = 400, 566
+            for i, idx in enumerate(page_indices):
+                pn = idx + 1
+                outpath = os.path.join(tmpdir, f"page_{pn:04d}.{ext}")
+                cmd = [mutool, "draw", "-r", str(dpi),
+                       "-o", outpath, "-F", ext,
+                       input_path, str(pn)]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    if not quiet and i == 0:
+                        print(f"  mutool failed: {result.stderr.strip()}")
+                    return None
+                with open(outpath, "rb") as f:
+                    img_data = f.read()
+                mime = "image/jpeg" if fmt == "jpeg" else "image/png"
+                b64 = f"data:{mime};base64,{base64.b64encode(img_data).decode('ascii')}"
+                w, h = _img_dims(outpath, img_data)
+                if i == 0:
+                    first_w, first_h = w, h
+                images.append(b64)
+                if not quiet:
+                    pct = (i + 1) / len(page_indices) * 100
+                    print(f"    {i+1}/{len(page_indices)} ({pct:.0f}%)", end='\r')
+            if not quiet:
+                print(f"    {len(page_indices)}/{len(page_indices)} (100%)   ")
+            return images, first_w, first_h
+
+        return None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _img_dims_from_jpeg(data):
+    w, h = 400, 566
+    try:
+        if data[:2] == b'\xff\xd8':
+            i = 2
+            while i < len(data) - 1:
+                if data[i] != 0xFF:
+                    break
+                marker = data[i + 1]
+                if marker in (0xC0, 0xC1, 0xC2):
+                    h = (data[i + 5] << 8) | data[i + 6]
+                    w = (data[i + 7] << 8) | data[i + 8]
+                    return w, h
+                elif marker == 0xD9:
+                    break
+                else:
+                    length = (data[i + 2] << 8) | data[i + 3]
+                    i += 2 + length
+    except Exception:
+        pass
+    return w, h
+
+
+def _img_dims(path_or_none, img_data):
+    w, h = 400, 566
+    try:
+        if path_or_none and os.path.exists(path_or_none):
+            import struct
+            with open(path_or_none, "rb") as f:
+                header = f.read(24)
+            if header[:8] == b'\x89PNG\r\n\x1a\n':
+                w = struct.unpack(">I", header[16:20])[0]
+                h = struct.unpack(">I", header[20:24])[0]
+            elif header[:2] == b'\xff\xd8':
+                pass
+    except Exception:
+        pass
+    return w, h
+
+
+def _render_pages_pymupdf(input_path, page_indices, dpi, fmt, quiet):
     src = pymupdf.open(input_path)
-    n_orig = src.page_count if not pages else pages[1] - pages[0] + 1
+    images = []
+    first_w, first_h = 400, 566
+    for i, idx in enumerate(page_indices):
+        page = src[idx]
+        pix = page.get_pixmap(dpi=dpi)
+        if fmt == "jpeg":
+            img_bytes = pix.tobytes("jpeg")
+            mime = "image/jpeg"
+            img_b64 = base64.b64encode(img_bytes).decode('ascii')
+        else:
+            img_bytes = pix.tobytes("png")
+            mime = "image/png"
+            img_b64 = base64.b64encode(img_bytes).decode('ascii')
+        b64_uri = f"data:{mime};base64,{img_b64}"
+        if i == 0:
+            first_w, first_h = pix.width, pix.height
+        images.append(b64_uri)
+        if not quiet:
+            pct = (i + 1) / len(page_indices) * 100
+            print(f"    {i+1}/{len(page_indices)} ({pct:.0f}%)", end='\r')
+    if not quiet:
+        print(f"    {len(page_indices)}/{len(page_indices)} (100%)   ")
+    src.close()
+    return images, first_w, first_h
+
+
+def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, quiet=False):
+    src = pymupdf.open(input_path)
+
+    if pages:
+        start, end = pages
+        page_indices = list(range(start - 1, min(end, src.page_count)))
+    else:
+        start = 1
+        end = src.page_count
+        page_indices = list(range(src.page_count))
+
+    n_orig = len(page_indices)
+    src.close()
+
     n_pages = n_orig
     while n_pages % 4 != 0:
         n_pages += 1
     n_sheets = n_pages // 4
 
+    if not quiet:
+        print(f"  Rendering {n_orig} pages to images...")
+
+    render_methods = [
+        ("pdftoppm", lambda: _render_pages_external(input_path, page_indices, 72, "jpeg", quiet)),
+        ("mutool", lambda: _render_pages_external(input_path, page_indices, 72, "jpeg", quiet)),
+    ]
+
+    page_images = None
+    page_w, page_h = 400, 566
+    used_method = None
+
+    for name, func in render_methods:
+        result = func()
+        if result is not None:
+            page_images, page_w, page_h = result
+            used_method = name
+            break
+
+    if page_images is None:
+        if not quiet:
+            print(f"  No external renderer found, using pymupdf (install poppler for faster rendering)...")
+        page_images, page_w, page_h = _render_pages_pymupdf(input_path, page_indices, 72, "jpeg", quiet)
+        used_method = "pymupdf"
+
+    if not quiet:
+        print(f"  Rendered {len(page_images)} pages via {used_method}")
+
     html_path = os.path.splitext(input_path)[0] + "-preview.html"
 
-    html = [f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>Booklet Preview</title>
-<style>
-body {{ font-family: system-ui, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; background: #f5f5f5; }}
-h1 {{ color: #333; }}
-.sheet {{ display: flex; gap: 4px; margin-bottom: 4px; }}
-.side {{ flex: 1; border: 2px solid #999; background: white; display: flex; position: relative; min-height: 120px; }}
-.page {{ flex: 1; border: 1px dashed #ccc; display: flex; align: center; justify-content: center; align-items: center; }}
-.page-num {{ font-size: 24px; color: #333; font-weight: bold; }}
-.page-blank {{ background: #f0f0f0; }}
-.page-blank .page-num {{ color: #ccc; }}
-.label {{ font-size: 11px; text-align: center; padding: 2px 4px; background: #e0e0e0; color: #555; position: absolute; top: 0; width: 100%; }}
-.back .label {{ background: #d0d0e0; }}
-</style></head><body>
-<h1>&#x1F4D6; Booklet Preview</h1>
-<p>PDF: <b>{os.path.basename(input_path)}</b> |
-   Pages: {n_orig} (+{n_pages - n_orig} blank) |
-   Sheets: {n_sheets}</p>
-<p>Print: <code>lp -d PRINTER -o media={paper_size.upper()} -o sides=two-sided-long-edge output.pdf</code></p>
-"""]
-
+    sheet_rows = []
     for sheet in range(n_sheets):
-        front_left  = n_pages - 2 * sheet
-        front_right = 2 * sheet + 1
-        back_left   = 2 * sheet + 2
-        back_right  = n_pages - 2 * sheet - 1
-
-        def fmt(p):
-            if p <= n_orig:
-                return f'<span class="page-num">{p}</span>'
-            return '<span class="page-num" style="color:#ccc;">&#8709;</span>'
-
-        html.append(f"""
-<div class="sheet">
+        fl = n_pages - 2 * sheet
+        fr = 2 * sheet + 1
+        bl = 2 * sheet + 2
+        br = n_pages - 2 * sheet - 1
+        def pn(p):
+            return f'<span class="pn">{p}</span>' if p <= n_orig else '<span class="pn blank">&#8709;</span>'
+        sheet_rows.append(f'''<div class="sheet-row">
+  <div class="sheet-num">{sheet+1}</div>
   <div class="side front">
-    <div class="label">Sheet {sheet+1} &mdash; FRONT</div>
-    <div class="page" style="margin-top:20px;">{fmt(front_left)}</div>
-    <div class="page" style="margin-top:20px;">{fmt(front_right)}</div>
+    <div class="side-label">FRONT</div>
+    <div class="half left">{pn(fl)}</div>
+    <div class="half right">{pn(fr)}</div>
   </div>
   <div class="side back">
-    <div class="label">Sheet {sheet+1} &mdash; BACK</div>
-    <div class="page" style="margin-top:20px; background:#f8f4ff;">{fmt(back_right)}<br><small style="color:#999;">&#x27F2;</small></div>
-    <div class="page" style="margin-top:20px; background:#f8f4ff;">{fmt(back_left)}<br><small style="color:#999;">&#x27F2;</small></div>
+    <div class="side-label">BACK &#x27F2;</div>
+    <div class="half left">{pn(br)}</div>
+    <div class="half right">{pn(bl)}</div>
   </div>
-</div>""")
+</div>''')
 
-    html.append("</body></html>")
+    pages_js = '[\n' + ',\n'.join(f'  "{img}"' for img in page_images) + '\n]'
+
+    html = f'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Booklet Preview &mdash; {os.path.basename(input_path)}</title>
+<style>
+* {{ margin: 0; padding: 0; box-sizing: border-box; }}
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: #1a1a2e; color: #eee; }}
+.header {{ background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 16px; border-bottom: 2px solid #0f3460; }}
+.header h1 {{ font-size: 18px; font-weight: 600; color: #e94560; }}
+.header .info {{ font-size: 13px; color: #888; }}
+.tabs {{ display: flex; gap: 0; }}
+.tab {{ padding: 8px 20px; cursor: pointer; font-size: 13px; font-weight: 500; background: #16213e; color: #888; border: 1px solid #0f3460; border-bottom: none; border-radius: 8px 8px 0 0; transition: all 0.2s; }}
+.tab.active {{ background: #1a1a2e; color: #e94560; border-color: #e94560; }}
+.tab:hover:not(.active) {{ color: #ccc; }}
+.content {{ display: none; }}
+.content.active {{ display: block; }}
+
+/* Flipbook view */
+#flipbook-view {{ min-height: calc(100vh - 100px); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }}
+#flipbook-container {{ width: 100%; max-width: 900px; }}
+.stf__parent {{ margin: 0 auto; }}
+.page-wrapper {{ perspective: 2000px; }}
+.flipbook-nav {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }}
+.flipbook-nav button {{ background: #0f3460; color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.2s; }}
+.flipbook-nav button:hover {{ background: #e94560; }}
+.flipbook-nav button:disabled {{ background: #333; color: #666; cursor: default; }}
+.flipbook-nav .page-info {{ font-size: 14px; color: #888; min-width: 100px; text-align: center; }}
+.loading {{ color: #888; font-size: 16px; text-align: center; padding: 40px; }}
+
+/* Fallback viewer (if StPageFlip fails) */
+#fallback-viewer {{ display: none; text-align: center; padding: 20px; }}
+#fallback-viewer .page-display {{ max-height: 75vh; display: flex; align-items: center; justify-content: center; }}
+#fallback-viewer .page-display img {{ max-height: 75vh; max-width: 90vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; }}
+#fallback-viewer .spread-display {{ display: flex; gap: 4px; justify-content: center; align-items: center; }}
+#fallback-viewer .spread-display img {{ max-height: 70vh; max-width: 45vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; }}
+
+/* Print layout view */
+#print-view {{ padding: 16px 20px; }}
+.sheet-row {{ display: flex; align-items: stretch; margin-bottom: 6px; gap: 6px; }}
+.sheet-num {{ width: 40px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: #e94560; flex-shrink: 0; }}
+.side {{ flex: 1; display: flex; border: 2px solid #333; border-radius: 6px; overflow: hidden; min-height: 48px; }}
+.side.front {{ background: #1e2a3a; }}
+.side.back {{ background: #2a1e2e; }}
+.side-label {{ font-size: 10px; padding: 2px 8px; background: rgba(255,255,255,0.1); color: #666; writing-mode: vertical-lr; display: flex; align-items: center; }}
+.half {{ flex: 1; display: flex; align-items: center; justify-content: center; padding: 8px 4px; border: 1px dashed #333; min-height: 48px; }}
+.pn {{ font-size: 18px; font-weight: 700; color: #ccc; }}
+.pn.blank {{ color: #444; }}
+.print-info {{ margin-top: 20px; padding: 12px 16px; background: #16213e; border-radius: 8px; border: 1px solid #0f3460; }}
+.print-info code {{ background: #0f3460; padding: 2px 6px; border-radius: 3px; color: #e94560; font-size: 13px; }}
+.print-info p {{ margin: 4px 0; font-size: 13px; color: #aaa; }}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>&#x1F4D6; Booklet Preview</h1>
+  <div class="info">{os.path.basename(input_path)} &bull; {n_orig} pages &bull; {n_sheets} {paper_size.upper()} sheets</div>
+  <div style="flex:1"></div>
+  <div class="tabs">
+    <div class="tab active" onclick="switchTab('flipbook')">&#x1F4DA; Flipbook</div>
+    <div class="tab" onclick="switchTab('print')">&#x1F5A8; Print Layout</div>
+  </div>
+</div>
+
+<div id="flipbook-view" class="content active">
+  <div id="loading" class="loading">Loading flipbook...</div>
+  <div id="flipbook-container" style="display:none;">
+    <div id="flipbook"></div>
+  </div>
+  <div class="flipbook-nav" id="flipbook-nav" style="display:none;">
+    <button id="btn-prev" onclick="flipPrev()">&#x25C0; Prev</button>
+    <span class="page-info" id="page-info">Page 1</span>
+    <button id="btn-next" onclick="flipNext()">Next &#x25B6;</button>
+  </div>
+  <div id="fallback-viewer">
+    <div id="fallback-display"></div>
+  </div>
+</div>
+
+<div id="print-view" class="content">
+  {''.join(sheet_rows)}
+  <div class="print-info">
+    <p><strong>Pages:</strong> {n_orig} (+{n_pages - n_orig} blank) &bull; <strong>Sheets:</strong> {n_sheets}</p>
+    <p><strong>Print command:</strong> <code>lp -d PRINTER -o media={paper_size.upper()} -o sides=two-sided-long-edge booklet.pdf</code></p>
+    <p><strong>Imposition order:</strong> Front L = N&minus;2i | Front R = 2i+1 | Back L (rotated 180&deg;) = N&minus;2i&minus;1 | Back R (rotated 180&deg;) = 2i+2</p>
+  </div>
+</div>
+
+<script>
+const PAGE_IMAGES = {pages_js};
+const TOTAL_PAGES = {n_orig};
+const TOTAL_SHEETS = {n_sheets};
+const PAGE_W = {page_w};
+const PAGE_H = {page_h};
+
+let pageFlip = null;
+let useFallback = false;
+
+function switchTab(name) {{
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+  if (name === 'flipbook') {{
+    document.querySelector('.tab:first-child').classList.add('active');
+    document.getElementById('flipbook-view').classList.add('active');
+  }} else {{
+    document.querySelector('.tab:last-child').classList.add('active');
+    document.getElementById('print-view').classList.add('active');
+  }}
+}}
+
+function initFlipbook() {{
+  const container = document.getElementById('flipbook');
+  const containerW = Math.min(window.innerWidth - 40, 900);
+  const containerH = window.innerHeight - 160;
+  const pageRatio = PAGE_W / PAGE_H;
+  const displayH = Math.min(containerH, 700);
+  const displayW = displayH * pageRatio;
+
+  try {{
+    const StPageFlip = window.St;
+    if (!StPageFlip || !StPageFlip.PageFlip) throw new Error('StPageFlip not loaded');
+
+    const pages = PAGE_IMAGES.map((src, i) => {{
+      const div = document.createElement('div');
+      div.className = 'page-wrapper';
+      div.style.width = displayW + 'px';
+      div.style.height = displayH + 'px';
+      div.setAttribute('data-density', i === 0 || i === TOTAL_PAGES - 1 ? 'hard' : 'soft');
+      const img = document.createElement('img');
+      img.src = src;
+      img.style.width = '100%';
+      img.style.height = '100%';
+      img.style.objectFit = 'contain';
+      img.alt = 'Page ' + (i + 1);
+      div.appendChild(img);
+      const label = document.createElement('div');
+      label.style.cssText = 'position:absolute;bottom:6px;right:10px;font-size:11px;color:rgba(0,0,0,0.35);';
+      label.textContent = i + 1;
+      div.appendChild(label);
+      return div;
+    }});
+
+    container.style.width = displayW + 'px';
+    container.style.height = displayH + 'px';
+    pages.forEach(p => container.appendChild(p));
+
+    pageFlip = new StPageFlip.PageFlip(container, {{
+      width: displayW,
+      height: displayH,
+      size: 'stretch',
+      minWidth: 280,
+      maxWidth: displayW * 1.5,
+      minHeight: 400,
+      maxHeight: displayH * 1.5,
+      showCover: true,
+      maxShadowOpacity: 0.5,
+      mobileScrollSupport: true,
+      clickEventForward: false,
+      useMouseEvents: true,
+      swipeDistance: 30,
+      showPageCorners: true,
+      disableFlipByClick: false,
+      flippingTime: 700,
+      usePortrait: true,
+      startZIndex: 0,
+      autoSize: true,
+      drawShadow: true,
+    }});
+
+    pageFlip.loadFromHTML(pages);
+    pageFlip.on('flip', (e) => updateNav());
+    pageFlip.on('changeOrientation', (e) => updateNav());
+
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('flipbook-container').style.display = 'block';
+    document.getElementById('flipbook-nav').style.display = 'flex';
+    updateNav();
+
+  }} catch (e) {{
+    console.warn('StPageFlip unavailable, using fallback viewer:', e);
+    useFallback = true;
+    initFallback();
+  }}
+}}
+
+function initFallback() {{
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('flipbook-container').style.display = 'none';
+  document.getElementById('flipbook-nav').style.display = 'flex';
+  const fb = document.getElementById('fallback-viewer');
+  fb.style.display = 'block';
+
+  let currentSpread = 0;
+  const totalSpreads = Math.ceil(TOTAL_PAGES / 2);
+
+  function showSpread() {{
+    const display = document.getElementById('fallback-display');
+    display.innerHTML = '';
+    display.className = 'spread-display';
+    const leftIdx = currentSpread * 2;
+    const rightIdx = currentSpread * 2 + 1;
+    const leftImg = document.createElement('img');
+    leftImg.src = PAGE_IMAGES[leftIdx];
+    leftImg.alt = 'Page ' + (leftIdx + 1);
+    display.appendChild(leftImg);
+    if (rightIdx < TOTAL_PAGES) {{
+      const rightImg = document.createElement('img');
+      rightImg.src = PAGE_IMAGES[rightIdx];
+      rightImg.alt = 'Page ' + (rightIdx + 1);
+      display.appendChild(rightImg);
+    }}
+    updateFallbackNav();
+  }}
+
+  function updateFallbackNav() {{
+    const leftPage = currentSpread * 2 + 1;
+    const rightPage = Math.min(currentSpread * 2 + 2, TOTAL_PAGES);
+    document.getElementById('page-info').textContent = leftPage + '-' + rightPage + ' / ' + TOTAL_PAGES;
+    document.getElementById('btn-prev').disabled = currentSpread === 0;
+    document.getElementById('btn-next').disabled = currentSpread >= totalSpreads - 1;
+  }}
+
+  window.flipPrev = () => {{ if (currentSpread > 0) {{ currentSpread--; showSpread(); }} }};
+  window.flipNext = () => {{ if (currentSpread < totalSpreads - 1) {{ currentSpread++; showSpread(); }} }};
+
+  showSpread();
+}}
+
+function updateNav() {{
+  if (!pageFlip) return;
+  const current = pageFlip.getPageIndex();
+  const leftPage = (current + 1);
+  const rightPage = Math.min(current + 2, TOTAL_PAGES);
+  document.getElementById('page-info').textContent = leftPage + '-' + rightPage + ' / ' + TOTAL_PAGES;
+  document.getElementById('btn-prev').disabled = current <= 0;
+  document.getElementById('btn-next').disabled = current >= TOTAL_PAGES - 2;
+}}
+
+function flipPrev() {{
+  if (useFallback) return;
+  if (pageFlip) pageFlip.flipPrev();
+}}
+
+function flipNext() {{
+  if (useFallback) return;
+  if (pageFlip) pageFlip.flipNext();
+}}
+
+document.addEventListener('keydown', (e) => {{
+  if (e.key === 'ArrowLeft') {{ flipPrev(); e.preventDefault(); }}
+  if (e.key === 'ArrowRight') {{ flipNext(); e.preventDefault(); }}
+}});
+
+const scripts = [
+  'https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js'
+];
+let loaded = 0;
+scripts.forEach(url => {{
+  const s = document.createElement('script');
+  s.src = url;
+  s.onload = () => {{ loaded++; if (loaded === scripts.length) initFlipbook(); }};
+  s.onerror = () => {{ loaded++; if (loaded === scripts.length) initFlipbook(); }};
+  document.head.appendChild(s);
+}});
+if (scripts.length === 0) initFlipbook();
+</script>
+</body>
+</html>'''
 
     with open(html_path, "w") as f:
-        f.write("\n".join(html))
+        f.write(html)
 
-    src.close()
-    print(f"  Preview HTML created: {html_path}")
-    print(f"  Open in browser: open {html_path}")
+    if not quiet:
+        size_mb = os.path.getsize(html_path) / (1024 * 1024)
+        print(f"  Preview: {html_path}")
+        print(f"  Size: {size_mb:.1f} MB")
+        print(f"  Open: open {html_path}")
+
     return html_path
 
 
