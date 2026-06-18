@@ -13,7 +13,6 @@ import argparse
 import math
 import sys
 import os
-import base64
 
 try:
     import pymupdf
@@ -313,246 +312,6 @@ def verify_booklet(input_path, paper_size="a4", pages=None, quiet=False):
         print(f"  {sheet+1:<6} {fl:<14} {fr:<14} {bl:<14} {br:<14} {sig_num:<6}")
 
     src.close()
-def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, quiet=False):
-    src = pymupdf.open(input_path)
-
-    if pages:
-        start, end = pages
-        page_indices = list(range(start - 1, min(end, src.page_count)))
-    else:
-        start = 1
-        end = src.page_count
-        page_indices = list(range(src.page_count))
-
-    n_orig = len(page_indices)
-    n_pages = n_orig
-    while n_pages % 4 != 0:
-        n_pages += 1
-    n_sheets = n_pages // 4
-
-    if not quiet:
-        print(f"  Rendering {n_orig} pages (72 DPI JPEG)...")
-
-    src_tmp = src
-    page_images = []
-    for i, idx in enumerate(page_indices):
-        page = src_tmp[idx]
-        pix = page.get_pixmap(dpi=72)
-        img_bytes = pix.tobytes("jpeg")
-        img_b64 = base64.b64encode(img_bytes).decode('ascii')
-        page_images.append(img_b64)
-        if not quiet:
-            pct = (i + 1) / n_orig * 100
-            print(f"    {i+1}/{n_orig} ({pct:.0f}%)", end='\r')
-    if not quiet:
-        print(f"    {n_orig}/{n_orig} (100%)   ")
-    src_tmp.close()
-
-    html_path = os.path.splitext(input_path)[0] + "-preview.html"
-
-    sheet_rows = []
-    for sheet in range(n_sheets):
-        fl = n_pages - 2 * sheet
-        fr = 2 * sheet + 1
-        bl = 2 * sheet + 2
-        br = n_pages - 2 * sheet - 1
-        def pn(p):
-            return f'<span class="pn">{p}</span>' if p <= n_orig else '<span class="pn blank">&#8709;</span>'
-        sheet_rows.append(f'''<div class="sheet-row">
-  <div class="sheet-num">{sheet+1}</div>
-  <div class="side front">
-    <div class="side-label">FRONT</div>
-    <div class="half left">{pn(fl)}</div>
-    <div class="half right">{pn(fr)}</div>
-  </div>
-  <div class="side back">
-    <div class="side-label">BACK &#x27F2;</div>
-    <div class="half left">{pn(br)}</div>
-    <div class="half right">{pn(bl)}</div>
-  </div>
-</div>''')
-
-    pages_json = '[' + ','.join(f'"{img}"' for img in page_images) + ']'
-
-    html = f'''<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>Booklet Preview &mdash; {os.path.basename(input_path)}</title>
-<style>
-* {{ margin: 0; padding: 0; box-sizing: border-box; }}
-body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; background: #1a1a2e; color: #eee; }}
-.header {{ background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 16px; border-bottom: 2px solid #0f3460; }}
-.header h1 {{ font-size: 18px; font-weight: 600; color: #e94560; }}
-.header .info {{ font-size: 13px; color: #888; }}
-.tabs {{ display: flex; gap: 0; }}
-.tab {{ padding: 8px 20px; cursor: pointer; font-size: 13px; font-weight: 500; background: #16213e; color: #888; border: 1px solid #0f3460; border-bottom: none; border-radius: 8px 8px 0 0; transition: all 0.2s; }}
-.tab.active {{ background: #1a1a2e; color: #e94560; border-color: #e94560; }}
-.tab:hover:not(.active) {{ color: #ccc; }}
-.content {{ display: none; }}
-.content.active {{ display: block; }}
-
-#spread-view {{ padding: 20px; text-align: center; min-height: 400px; user-select: none; }}
-#spread-view .spreader {{ display: flex; gap: 4px; justify-content: center; align-items: center; perspective: 1800px; min-height: 60vh; }}
-#spread-view .spreader img {{ max-height: 75vh; max-width: 44vw; box-shadow: 0 4px 30px rgba(0,0,0,0.6); border-radius: 4px; background: #fff; transition: transform 0.4s ease, box-shadow 0.4s ease; cursor: pointer; }}
-#spread-view .spreader img:hover {{ box-shadow: 0 8px 40px rgba(233,69,96,0.3); }}
-#spread-view .spreader img.turning {{ transform: rotateY(-12deg); }}
-.nav {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }}
-.nav button {{ background: #0f3460; color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.2s; min-width: 80px; }}
-.nav button:hover {{ background: #e94560; }}
-.nav button:disabled {{ background: #333; color: #666; cursor: default; }}
-.nav .info {{ font-size: 14px; color: #888; min-width: 130px; text-align: center; }}
-.nav input[type=range] {{ width: 160px; accent-color: #e94560; }}
-
-#print-view {{ padding: 16px 20px; }}
-.sheet-row {{ display: flex; align-items: stretch; margin-bottom: 6px; gap: 6px; }}
-.sheet-num {{ width: 40px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: #e94560; flex-shrink: 0; }}
-.side {{ flex: 1; display: flex; border: 2px solid #333; border-radius: 6px; overflow: hidden; min-height: 48px; }}
-.side.front {{ background: #1e2a3a; }}
-.side.back {{ background: #2a1e2e; }}
-.side-label {{ font-size: 10px; padding: 2px 8px; background: rgba(255,255,255,0.1); color: #666; writing-mode: vertical-lr; display: flex; align-items: center; }}
-.half {{ flex: 1; display: flex; align-items: center; justify-content: center; padding: 8px 4px; border: 1px dashed #333; min-height: 48px; }}
-.pn {{ font-size: 18px; font-weight: 700; color: #ccc; }}
-.pn.blank {{ color: #444; }}
-.print-info {{ margin-top: 20px; padding: 12px 16px; background: #16213e; border-radius: 8px; border: 1px solid #0f3460; }}
-.print-info code {{ background: #0f3460; padding: 2px 6px; border-radius: 3px; color: #e94560; font-size: 13px; }}
-.print-info p {{ margin: 4px 0; font-size: 13px; color: #aaa; }}
-</style>
-</head>
-<body>
-
-<div class="header">
-  <h1>&#x1F4D6; Booklet Preview</h1>
-  <div class="info">{os.path.basename(input_path)} &bull; {n_orig} pages &bull; {n_sheets} {paper_size.upper()} sheets</div>
-  <div style="flex:1"></div>
-  <div class="tabs">
-    <div class="tab active" onclick="switchTab('spread')">&#x1F4DA; Reader</div>
-    <div class="tab" onclick="switchTab('print')">&#x1F5A8; Print Layout</div>
-  </div>
-</div>
-
-<div id="spread-view" class="content active">
-  <div class="spreader" id="spreader"></div>
-  <div class="nav" id="nav">
-    <button id="btn-first" onclick="goFirst()">&#x23EE; First</button>
-    <button id="btn-prev" onclick="goPrev()">&#x25C0; Prev</button>
-    <span class="info" id="page-info">1 &ndash; 2 / {n_orig}</span>
-    <button id="btn-next" onclick="goNext()">Next &#x25B6;</button>
-    <button id="btn-last" onclick="goLast()">Last &#x23ED;</button>
-    <input type="range" id="page-slider" min="0" max="{math.ceil(n_orig/2)-1}" value="0" oninput="goSpread(parseInt(this.value))" style="margin-left:12px;">
-  </div>
-</div>
-
-<div id="print-view" class="content">
-  {''.join(sheet_rows)}
-  <div class="print-info">
-    <p><strong>Pages:</strong> {n_orig} (+{n_pages - n_orig} blank) &bull; <strong>Sheets:</strong> {n_sheets}</p>
-    <p><strong>Print command:</strong> <code>lp -d PRINTER -o media={paper_size.upper()} -o sides=two-sided-long-edge booklet.pdf</code></p>
-    <p><strong>Imposition order:</strong> Front L = N&minus;2i | Front R = 2i+1 | Back L (rotated 180&deg;) = N&minus;2i&minus;1 | Back R (rotated 180&deg;) = 2i+2</p>
-  </div>
-</div>
-
-<script>
-const PAGES = {pages_json};
-const TOTAL = {n_orig};
-const TOTAL_SHEETS = {n_sheets};
-const TOTAL_SPREADS = Math.ceil(TOTAL / 2);
-let spread = 0;
-
-function switchTab(name) {{
-  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-  document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
-  document.querySelector(name === 'spread' ? '.tab:first-child' : '.tab:last-child').classList.add('active');
-  document.getElementById(name + '-view').classList.add('active');
-}}
-
-function showSpread() {{
-  const c = document.getElementById('spreader');
-  c.innerHTML = '';
-  const left = spread * 2;
-  const right = spread * 2 + 1;
-  if (left < TOTAL) {{
-    const img = document.createElement('img');
-    img.src = 'data:image/jpeg;base64,' + PAGES[left];
-    img.alt = 'Page ' + (left + 1);
-    img.title = 'Page ' + (left + 1);
-    c.appendChild(img);
-  }}
-  if (right < TOTAL) {{
-    const img = document.createElement('img');
-    img.src = 'data:image/jpeg;base64,' + PAGES[right];
-    img.alt = 'Page ' + (right + 1);
-    img.title = 'Page ' + (right + 1);
-    c.appendChild(img);
-  }}
-  const leftPage = spread * 2 + 1;
-  const rightPage = Math.min(spread * 2 + 2, TOTAL);
-  document.getElementById('page-info').textContent = leftPage + ' &ndash; ' + rightPage + ' / ' + TOTAL;
-  document.getElementById('btn-prev').disabled = spread === 0;
-  document.getElementById('btn-first').disabled = spread === 0;
-  document.getElementById('btn-next').disabled = spread >= TOTAL_SPREADS - 1;
-  document.getElementById('btn-last').disabled = spread >= TOTAL_SPREADS - 1;
-  document.getElementById('page-slider').value = spread;
-}}
-
-function goPrev() {{ if (spread > 0) {{ spread--; showSpread(); }} }}
-function goNext() {{ if (spread < TOTAL_SPREADS - 1) {{ spread++; showSpread(); }} }}
-function goFirst() {{ spread = 0; showSpread(); }}
-function goLast() {{ spread = TOTAL_SPREADS - 1; showSpread(); }}
-function goSpread(s) {{ spread = s; showSpread(); }}
-
-document.addEventListener('keydown', e => {{
-  if (document.querySelector('.tab.active').textContent.includes('Reader')) {{
-    if (e.key === 'ArrowRight' || e.key === ' ') {{ goNext(); e.preventDefault(); }}
-    if (e.key === 'ArrowLeft') {{ goPrev(); e.preventDefault(); }}
-    if (e.key === 'Home') {{ goFirst(); e.preventDefault(); }}
-    if (e.key === 'End') {{ goLast(); e.preventDefault(); }}
-  }}
-}});
-
-showSpread();
-</script>
-</body>
-</html>'''
-
-    with open(html_path, "w") as f:
-        f.write(html)
-
-    if not quiet:
-        size_mb = os.path.getsize(html_path) / (1024 * 1024)
-        print(f"  Preview: {html_path}")
-        print(f"  Size: {size_mb:.1f} MB")
-        print(f"  Open: open {html_path}")
-
-    import webbrowser
-    webbrowser.open(f"file://{os.path.abspath(html_path)}")
-
-    return html_path
-
-    url = f"http://127.0.0.1:{port}/{preview_filename}"
-
-    def serve():
-        os.chdir(preview_dir)
-        server.serve_forever()
-
-    thread = threading.Thread(target=serve, daemon=True)
-    thread.start()
-
-    if not quiet:
-        print(f"  Server: {url}")
-        print(f"  Press Ctrl+C to stop server")
-
-    webbrowser.open(url)
-
-    try:
-        thread.join()
-    except KeyboardInterrupt:
-        server.shutdown()
-        if not quiet:
-            print(f"\n  Server stopped.")
-
-    return html_path
-
 
 def deimpose_booklet(input_path, output_path, quiet=False):
     src = pymupdf.open(input_path)
@@ -643,9 +402,6 @@ EXAMPLES:
   # With gutter margin and crop marks
   %(prog)s document.pdf booklet.pdf --gutter 5 --crop-marks
 
-  # Generate HTML preview
-  %(prog)s document.pdf --preview
-
   # De-impose a booklet
   %(prog)s booklet.pdf restored.pdf --deimpose
 
@@ -696,8 +452,7 @@ PRINTING:
                             help="Show page order without generating PDF")
     check_group.add_argument("--test", "-t", type=int, default=None, metavar="N",
                             help="Extract only sheet N for test printing")
-    check_group.add_argument("--preview", "-p", action="store_true",
-                            help="Generate interactive HTML preview")
+
 
     other_group = parser.add_argument_group("Other options")
     other_group.add_argument("--deimpose", "-d", action="store_true",
@@ -720,10 +475,6 @@ PRINTING:
 
     if args.verify:
         verify_booklet(args.input[0], args.size, pages, args.quiet)
-        return
-
-    if args.preview:
-        generate_preview(args.input[0], args.size, args.source, pages)
         return
 
     if args.deimpose:
