@@ -14,9 +14,6 @@ import math
 import sys
 import os
 import base64
-import shutil
-import subprocess
-import tempfile
 
 try:
     import pymupdf
@@ -316,154 +313,6 @@ def verify_booklet(input_path, paper_size="a4", pages=None, quiet=False):
         print(f"  {sheet+1:<6} {fl:<14} {fr:<14} {bl:<14} {br:<14} {sig_num:<6}")
 
     src.close()
-
-
-def _render_pages_external(input_path, page_indices, dpi, fmt, quiet):
-    ext = "jpg" if fmt == "jpeg" else "png"
-    tmpdir = tempfile.mkdtemp(prefix="booklet-preview-")
-    try:
-        pdftoppm = shutil.which("pdftoppm")
-        mutool = shutil.which("mutool")
-        first_page = page_indices[0] + 1
-        last_page = page_indices[-1] + 1
-
-        if pdftoppm:
-            if not quiet:
-                print(f"  Rendering with pdftoppm (poppler)...")
-            prefix = os.path.join(tmpdir, "page")
-            cmd = [pdftoppm, "-jpeg", "-r", str(dpi),
-                   "-f", str(first_page), "-l", str(last_page),
-                   input_path, prefix]
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode != 0:
-                if not quiet:
-                    print(f"  pdftoppm failed: {result.stderr.strip()[:200]}")
-                return None
-            images = []
-            first_w, first_h = 400, 566
-            for i, idx in enumerate(page_indices):
-                pn = idx + 1
-                path = os.path.join(tmpdir, f"page-{pn:02d}.jpg")
-                if not os.path.exists(path):
-                    if not quiet:
-                        print(f"  pdftoppm: missing {path}")
-                    return None
-                with open(path, "rb") as f:
-                    img_data = f.read()
-                mime = "image/jpeg"
-                b64 = f"data:{mime};base64,{base64.b64encode(img_data).decode('ascii')}"
-                w, h = _img_dims_from_jpeg(img_data)
-                if i == 0:
-                    first_w, first_h = w, h
-                images.append(b64)
-            if images:
-                return images, first_w, first_h
-            return None
-
-        elif mutool:
-            if not quiet:
-                print(f"  Rendering with mutool (mupdf)...")
-            images = []
-            first_w, first_h = 400, 566
-            for i, idx in enumerate(page_indices):
-                pn = idx + 1
-                outpath = os.path.join(tmpdir, f"page_{pn:04d}.{ext}")
-                cmd = [mutool, "draw", "-r", str(dpi),
-                       "-o", outpath, "-F", ext,
-                       input_path, str(pn)]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    if not quiet and i == 0:
-                        print(f"  mutool failed: {result.stderr.strip()}")
-                    return None
-                with open(outpath, "rb") as f:
-                    img_data = f.read()
-                mime = "image/jpeg" if fmt == "jpeg" else "image/png"
-                b64 = f"data:{mime};base64,{base64.b64encode(img_data).decode('ascii')}"
-                w, h = _img_dims(outpath, img_data)
-                if i == 0:
-                    first_w, first_h = w, h
-                images.append(b64)
-                if not quiet:
-                    pct = (i + 1) / len(page_indices) * 100
-                    print(f"    {i+1}/{len(page_indices)} ({pct:.0f}%)", end='\r')
-            if not quiet:
-                print(f"    {len(page_indices)}/{len(page_indices)} (100%)   ")
-            return images, first_w, first_h
-
-        return None
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-
-
-def _img_dims_from_jpeg(data):
-    w, h = 400, 566
-    try:
-        if data[:2] == b'\xff\xd8':
-            i = 2
-            while i < len(data) - 1:
-                if data[i] != 0xFF:
-                    break
-                marker = data[i + 1]
-                if marker in (0xC0, 0xC1, 0xC2):
-                    h = (data[i + 5] << 8) | data[i + 6]
-                    w = (data[i + 7] << 8) | data[i + 8]
-                    return w, h
-                elif marker == 0xD9:
-                    break
-                else:
-                    length = (data[i + 2] << 8) | data[i + 3]
-                    i += 2 + length
-    except Exception:
-        pass
-    return w, h
-
-
-def _img_dims(path_or_none, img_data):
-    w, h = 400, 566
-    try:
-        if path_or_none and os.path.exists(path_or_none):
-            import struct
-            with open(path_or_none, "rb") as f:
-                header = f.read(24)
-            if header[:8] == b'\x89PNG\r\n\x1a\n':
-                w = struct.unpack(">I", header[16:20])[0]
-                h = struct.unpack(">I", header[20:24])[0]
-            elif header[:2] == b'\xff\xd8':
-                pass
-    except Exception:
-        pass
-    return w, h
-
-
-def _render_pages_pymupdf(input_path, page_indices, dpi, fmt, quiet):
-    src = pymupdf.open(input_path)
-    images = []
-    first_w, first_h = 400, 566
-    for i, idx in enumerate(page_indices):
-        page = src[idx]
-        pix = page.get_pixmap(dpi=dpi)
-        if fmt == "jpeg":
-            img_bytes = pix.tobytes("jpeg")
-            mime = "image/jpeg"
-            img_b64 = base64.b64encode(img_bytes).decode('ascii')
-        else:
-            img_bytes = pix.tobytes("png")
-            mime = "image/png"
-            img_b64 = base64.b64encode(img_bytes).decode('ascii')
-        b64_uri = f"data:{mime};base64,{img_b64}"
-        if i == 0:
-            first_w, first_h = pix.width, pix.height
-        images.append(b64_uri)
-        if not quiet:
-            pct = (i + 1) / len(page_indices) * 100
-            print(f"    {i+1}/{len(page_indices)} ({pct:.0f}%)", end='\r')
-    if not quiet:
-        print(f"    {len(page_indices)}/{len(page_indices)} (100%)   ")
-    src.close()
-    return images, first_w, first_h
-
-
 def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, quiet=False):
     src = pymupdf.open(input_path)
 
@@ -476,40 +325,21 @@ def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, 
         page_indices = list(range(src.page_count))
 
     n_orig = len(page_indices)
-    src.close()
-
     n_pages = n_orig
     while n_pages % 4 != 0:
         n_pages += 1
     n_sheets = n_pages // 4
+    src.close()
 
     if not quiet:
-        print(f"  Rendering {n_orig} pages to images...")
+        print(f"  Embedding PDF ({n_orig} pages)...")
 
-    render_methods = [
-        ("pdftoppm", lambda: _render_pages_external(input_path, page_indices, 72, "jpeg", quiet)),
-        ("mutool", lambda: _render_pages_external(input_path, page_indices, 72, "jpeg", quiet)),
-    ]
-
-    page_images = None
-    page_w, page_h = 400, 566
-    used_method = None
-
-    for name, func in render_methods:
-        result = func()
-        if result is not None:
-            page_images, page_w, page_h = result
-            used_method = name
-            break
-
-    if page_images is None:
-        if not quiet:
-            print(f"  No external renderer found, using pymupdf (install poppler for faster rendering)...")
-        page_images, page_w, page_h = _render_pages_pymupdf(input_path, page_indices, 72, "jpeg", quiet)
-        used_method = "pymupdf"
+    with open(input_path, "rb") as f:
+        pdf_b64 = base64.b64encode(f.read()).decode('ascii')
 
     if not quiet:
-        print(f"  Rendered {len(page_images)} pages via {used_method}")
+        pdf_size_mb = len(pdf_b64) * 3 / 4 / (1024 * 1024)
+        print(f"  PDF embedded: {pdf_size_mb:.1f} MB")
 
     html_path = os.path.splitext(input_path)[0] + "-preview.html"
 
@@ -535,8 +365,6 @@ def generate_preview(input_path, paper_size="a4", source_size="a5", pages=None, 
   </div>
 </div>''')
 
-    pages_js = '[\n' + ',\n'.join(f'  "{img}"' for img in page_images) + '\n]'
-
     html = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -555,26 +383,22 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
 .content {{ display: none; }}
 .content.active {{ display: block; }}
 
-/* Flipbook view */
 #flipbook-view {{ min-height: calc(100vh - 100px); display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }}
 #flipbook-container {{ width: 100%; max-width: 900px; }}
 .stf__parent {{ margin: 0 auto; }}
-.page-wrapper {{ perspective: 2000px; }}
 .flipbook-nav {{ display: flex; align-items: center; justify-content: center; gap: 12px; margin-top: 16px; }}
 .flipbook-nav button {{ background: #0f3460; color: #fff; border: none; padding: 8px 20px; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.2s; }}
 .flipbook-nav button:hover {{ background: #e94560; }}
 .flipbook-nav button:disabled {{ background: #333; color: #666; cursor: default; }}
-.flipbook-nav .page-info {{ font-size: 14px; color: #888; min-width: 100px; text-align: center; }}
+.flipbook-nav .page-info {{ font-size: 14px; color: #888; min-width: 120px; text-align: center; }}
 .loading {{ color: #888; font-size: 16px; text-align: center; padding: 40px; }}
+.progress-bar {{ width: 200px; height: 6px; background: #333; border-radius: 3px; margin: 12px auto; overflow: hidden; }}
+.progress-fill {{ height: 100%; background: #e94560; border-radius: 3px; transition: width 0.3s; }}
 
-/* Fallback viewer (if StPageFlip fails) */
 #fallback-viewer {{ display: none; text-align: center; padding: 20px; }}
-#fallback-viewer .page-display {{ max-height: 75vh; display: flex; align-items: center; justify-content: center; }}
-#fallback-viewer .page-display img {{ max-height: 75vh; max-width: 90vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; }}
-#fallback-viewer .spread-display {{ display: flex; gap: 4px; justify-content: center; align-items: center; }}
-#fallback-viewer .spread-display img {{ max-height: 70vh; max-width: 45vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; }}
+.spread-display {{ display: flex; gap: 4px; justify-content: center; align-items: center; }}
+.spread-display img {{ max-height: 75vh; max-width: 45vw; box-shadow: 0 4px 24px rgba(0,0,0,0.5); border-radius: 4px; background: #fff; }}
 
-/* Print layout view */
 #print-view {{ padding: 16px 20px; }}
 .sheet-row {{ display: flex; align-items: stretch; margin-bottom: 6px; gap: 6px; }}
 .sheet-num {{ width: 40px; display: flex; align-items: center; justify-content: center; font-size: 14px; font-weight: 700; color: #e94560; flex-shrink: 0; }}
@@ -603,7 +427,10 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
 </div>
 
 <div id="flipbook-view" class="content active">
-  <div id="loading" class="loading">Loading flipbook...</div>
+  <div id="loading" class="loading">
+    <div id="loading-text">Loading PDF...</div>
+    <div class="progress-bar"><div class="progress-fill" id="progress-fill" style="width: 0%"></div></div>
+  </div>
   <div id="flipbook-container" style="display:none;">
     <div id="flipbook"></div>
   </div>
@@ -613,7 +440,7 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
     <button id="btn-next" onclick="flipNext()">Next &#x25B6;</button>
   </div>
   <div id="fallback-viewer">
-    <div id="fallback-display"></div>
+    <div id="fallback-display" class="spread-display"></div>
   </div>
 </div>
 
@@ -627,14 +454,13 @@ body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, s
 </div>
 
 <script>
-const PAGE_IMAGES = {pages_js};
+const PDF_DATA = "{pdf_b64}";
 const TOTAL_PAGES = {n_orig};
 const TOTAL_SHEETS = {n_sheets};
-const PAGE_W = {page_w};
-const PAGE_H = {page_h};
 
 let pageFlip = null;
 let useFallback = false;
+let pageImages = [];
 
 function switchTab(name) {{
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
@@ -648,87 +474,145 @@ function switchTab(name) {{
   }}
 }}
 
+async function loadPDF() {{
+  const loadingText = document.getElementById('loading-text');
+  const progressFill = document.getElementById('progress-fill');
+
+  try {{
+    loadingText.textContent = 'Loading PDF.js...';
+    const pdfjsLib = window['pdfjs-dist/build/pdf'];
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.worker.min.mjs';
+
+    loadingText.textContent = 'Parsing PDF...';
+    progressFill.style.width = '10%';
+
+    const pdfDoc = await pdfjsLib.getDocument({{ data: atob(PDF_DATA) }}).promise;
+    const numPages = pdfDoc.numPages;
+
+    loadingText.textContent = 'Rendering pages (0/' + numPages + ')...';
+
+    const SCALE = 1.5;
+    pageImages = [];
+
+    for (let i = 1; i <= numPages; i++) {{
+      const page = await pdfDoc.getPage(i);
+      const viewport = page.getViewport({{ scale: SCALE }});
+      const canvas = document.createElement('canvas');
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      const ctx = canvas.getContext('2d');
+
+      await page.render({{ canvasContext: ctx, viewport: viewport }}).promise;
+
+      pageImages.push(canvas.toDataURL('image/jpeg', 0.75));
+
+      const pct = Math.round((i / numPages) * 80) + 10;
+      progressFill.style.width = pct + '%';
+      loadingText.textContent = 'Rendering pages (' + i + '/' + numPages + ')...';
+    }}
+
+    progressFill.style.width = '95%';
+    loadingText.textContent = 'Initializing flipbook...';
+    initFlipbook();
+
+  }} catch (e) {{
+    console.error('PDF.js failed:', e);
+    loadingText.textContent = 'PDF.js failed: ' + e.message + '. Using fallback.';
+    useFallback = true;
+    initFallbackFromPDF();
+  }}
+}}
+
 function initFlipbook() {{
   const container = document.getElementById('flipbook');
   const containerW = Math.min(window.innerWidth - 40, 900);
   const containerH = window.innerHeight - 160;
-  const pageRatio = PAGE_W / PAGE_H;
-  const displayH = Math.min(containerH, 700);
-  const displayW = displayH * pageRatio;
 
-  try {{
-    const StPageFlip = window.St;
-    if (!StPageFlip || !StPageFlip.PageFlip) throw new Error('StPageFlip not loaded');
-
-    const pages = PAGE_IMAGES.map((src, i) => {{
-      const div = document.createElement('div');
-      div.className = 'page-wrapper';
-      div.style.width = displayW + 'px';
-      div.style.height = displayH + 'px';
-      div.setAttribute('data-density', i === 0 || i === TOTAL_PAGES - 1 ? 'hard' : 'soft');
-      const img = document.createElement('img');
-      img.src = src;
-      img.style.width = '100%';
-      img.style.height = '100%';
-      img.style.objectFit = 'contain';
-      img.alt = 'Page ' + (i + 1);
-      div.appendChild(img);
-      const label = document.createElement('div');
-      label.style.cssText = 'position:absolute;bottom:6px;right:10px;font-size:11px;color:rgba(0,0,0,0.35);';
-      label.textContent = i + 1;
-      div.appendChild(label);
-      return div;
-    }});
-
-    container.style.width = displayW + 'px';
-    container.style.height = displayH + 'px';
-    pages.forEach(p => container.appendChild(p));
-
-    pageFlip = new StPageFlip.PageFlip(container, {{
-      width: displayW,
-      height: displayH,
-      size: 'stretch',
-      minWidth: 280,
-      maxWidth: displayW * 1.5,
-      minHeight: 400,
-      maxHeight: displayH * 1.5,
-      showCover: true,
-      maxShadowOpacity: 0.5,
-      mobileScrollSupport: true,
-      clickEventForward: false,
-      useMouseEvents: true,
-      swipeDistance: 30,
-      showPageCorners: true,
-      disableFlipByClick: false,
-      flippingTime: 700,
-      usePortrait: true,
-      startZIndex: 0,
-      autoSize: true,
-      drawShadow: true,
-    }});
-
-    pageFlip.loadFromHTML(pages);
-    pageFlip.on('flip', (e) => updateNav());
-    pageFlip.on('changeOrientation', (e) => updateNav());
-
-    document.getElementById('loading').style.display = 'none';
-    document.getElementById('flipbook-container').style.display = 'block';
-    document.getElementById('flipbook-nav').style.display = 'flex';
-    updateNav();
-
-  }} catch (e) {{
-    console.warn('StPageFlip unavailable, using fallback viewer:', e);
+  if (pageImages.length === 0) {{
     useFallback = true;
-    initFallback();
+    initSimpleFallback();
+    return;
   }}
+
+  const tmpImg = new Image();
+  tmpImg.src = pageImages[0];
+  tmpImg.onload = function() {{
+    const pageRatio = tmpImg.naturalWidth / tmpImg.naturalHeight;
+    const displayH = Math.min(containerH, 700);
+    const displayW = displayH * pageRatio;
+
+    try {{
+      const StPageFlip = window.St;
+      if (!StPageFlip || !StPageFlip.PageFlip) throw new Error('StPageFlip not loaded');
+
+      const pages = pageImages.map((src, i) => {{
+        const div = document.createElement('div');
+        div.className = 'page-wrapper';
+        div.style.width = displayW + 'px';
+        div.style.height = displayH + 'px';
+        div.setAttribute('data-density', i === 0 || i === TOTAL_PAGES - 1 ? 'hard' : 'soft');
+        const img = document.createElement('img');
+        img.src = src;
+        img.style.width = '100%';
+        img.style.height = '100%';
+        img.style.objectFit = 'contain';
+        img.alt = 'Page ' + (i + 1);
+        div.appendChild(img);
+        const label = document.createElement('div');
+        label.style.cssText = 'position:absolute;bottom:6px;right:10px;font-size:11px;color:rgba(0,0,0,0.35);';
+        label.textContent = i + 1;
+        div.appendChild(label);
+        return div;
+      }});
+
+      container.style.width = displayW + 'px';
+      container.style.height = displayH + 'px';
+      pages.forEach(p => container.appendChild(p));
+
+      pageFlip = new StPageFlip.PageFlip(container, {{
+        width: displayW,
+        height: displayH,
+        size: 'stretch',
+        minWidth: 280,
+        maxWidth: displayW * 1.5,
+        minHeight: 400,
+        maxHeight: displayH * 1.5,
+        showCover: true,
+        maxShadowOpacity: 0.5,
+        mobileScrollSupport: true,
+        clickEventForward: false,
+        useMouseEvents: true,
+        swipeDistance: 30,
+        showPageCorners: true,
+        disableFlipByClick: false,
+        flippingTime: 700,
+        usePortrait: true,
+        startZIndex: 0,
+        autoSize: true,
+        drawShadow: true,
+      }});
+
+      pageFlip.loadFromHTML(pages);
+      pageFlip.on('flip', (e) => updateNav());
+      pageFlip.on('changeOrientation', (e) => updateNav());
+
+      document.getElementById('loading').style.display = 'none';
+      document.getElementById('flipbook-container').style.display = 'block';
+      document.getElementById('flipbook-nav').style.display = 'flex';
+      updateNav();
+
+    }} catch (e) {{
+      console.warn('StPageFlip unavailable, using spread viewer:', e);
+      useFallback = true;
+      initSpreadViewer(displayW, displayH);
+    }}
+  }};
 }}
 
-function initFallback() {{
+function initSpreadViewer(pageW, pageH) {{
   document.getElementById('loading').style.display = 'none';
   document.getElementById('flipbook-container').style.display = 'none';
   document.getElementById('flipbook-nav').style.display = 'flex';
-  const fb = document.getElementById('fallback-viewer');
-  fb.style.display = 'block';
 
   let currentSpread = 0;
   const totalSpreads = Math.ceil(TOTAL_PAGES / 2);
@@ -736,16 +620,17 @@ function initFallback() {{
   function showSpread() {{
     const display = document.getElementById('fallback-display');
     display.innerHTML = '';
-    display.className = 'spread-display';
     const leftIdx = currentSpread * 2;
     const rightIdx = currentSpread * 2 + 1;
-    const leftImg = document.createElement('img');
-    leftImg.src = PAGE_IMAGES[leftIdx];
-    leftImg.alt = 'Page ' + (leftIdx + 1);
-    display.appendChild(leftImg);
-    if (rightIdx < TOTAL_PAGES) {{
+    if (pageImages[leftIdx]) {{
+      const leftImg = document.createElement('img');
+      leftImg.src = pageImages[leftIdx];
+      leftImg.alt = 'Page ' + (leftIdx + 1);
+      display.appendChild(leftImg);
+    }}
+    if (rightIdx < TOTAL_PAGES && pageImages[rightIdx]) {{
       const rightImg = document.createElement('img');
-      rightImg.src = PAGE_IMAGES[rightIdx];
+      rightImg.src = pageImages[rightIdx];
       rightImg.alt = 'Page ' + (rightIdx + 1);
       display.appendChild(rightImg);
     }}
@@ -764,6 +649,22 @@ function initFallback() {{
   window.flipNext = () => {{ if (currentSpread < totalSpreads - 1) {{ currentSpread++; showSpread(); }} }};
 
   showSpread();
+}}
+
+function initSimpleFallback() {{
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('flipbook-container').style.display = 'none';
+  document.getElementById('flipbook-nav').style.display = 'flex';
+  const display = document.getElementById('fallback-display');
+  display.innerHTML = '<p style="color:#888;">PDF rendering unavailable. Install poppler (pdftoppm) or mutool for best results.</p>';
+}}
+
+function initFallbackFromPDF() {{
+  document.getElementById('loading').style.display = 'none';
+  document.getElementById('flipbook-container').style.display = 'none';
+  document.getElementById('flipbook-nav').style.display = 'flex';
+  const display = document.getElementById('fallback-display');
+  display.innerHTML = '<p style="color:#888;">Failed to render PDF.</p>';
 }}
 
 function updateNav() {{
@@ -791,18 +692,47 @@ document.addEventListener('keydown', (e) => {{
   if (e.key === 'ArrowRight') {{ flipNext(); e.preventDefault(); }}
 }});
 
-const scripts = [
+const externalScripts = [
+  'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/pdf.min.mjs',
   'https://cdn.jsdelivr.net/npm/page-flip@2.0.7/dist/js/page-flip.browser.js'
 ];
-let loaded = 0;
-scripts.forEach(url => {{
+let loadedCount = 0;
+const totalScripts = externalScripts.length;
+let pdfjsReady = false;
+let pageflipReady = false;
+
+externalScripts.forEach(url => {{
   const s = document.createElement('script');
-  s.src = url;
-  s.onload = () => {{ loaded++; if (loaded === scripts.length) initFlipbook(); }};
-  s.onerror = () => {{ loaded++; if (loaded === scripts.length) initFlipbook(); }};
+  s.type = url.endsWith('.mjs') ? 'module' : 'text/javascript';
+  if (url.endsWith('.mjs')) {{
+    s.type = 'module';
+    s.textContent = 'import * as pdfjsLib from "' + url + '"; window["pdfjs-dist/build/pdf"] = pdfjsLib; window.dispatchEvent(new Event("pdfjs-loaded"));';
+  }} else {{
+    s.src = url;
+  }}
+  s.onload = () => {{
+    if (url.includes('page-flip')) pageflipReady = true;
+    checkAllLoaded();
+  }};
+  s.onerror = () => {{ checkAllLoaded(); }};
   document.head.appendChild(s);
 }});
-if (scripts.length === 0) initFlipbook();
+
+window.addEventListener('pdfjs-loaded', () => {{
+  pdfjsReady = true;
+  checkAllLoaded();
+}});
+
+setTimeout(() => {{ checkAllLoaded(); }}, 500);
+
+function checkAllLoaded() {{
+  if (pdfjsReady && pageflipReady) {{
+    loadPDF();
+  }} else if (!pdfjsReady && !pageflipReady) {{
+    // Both failed, try anyway with what we have
+    setTimeout(() => {{ if (!pdfjsReady || !pageflipReady) loadPDF(); }}, 2000);
+  }}
+}}
 </script>
 </body>
 </html>'''
